@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -7,26 +8,32 @@ import matplotlib.pyplot as plt
 import torch
 from depth_anything_v2.dpt import DepthAnythingV2
 from nexera_packages.utilities.image_processing import *
-from sklearn.cluster import DBSCAN, MeanShift
+from sklearn.cluster import AffinityPropagation, Birch, KMeans, MeanShift
+from sklearn.decomposition import PCA
+from sklearn.mixture import GaussianMixture
 from tqdm import tqdm
 
-# these colors are in BGR format
-predefined_colors = [
-    [0, 0, 255],    # Red
-    [0, 255, 0],    # Green
-    [255, 0, 0],    # Blue
-    [0, 255, 255],  # Yellow
-    [255, 0, 255],  # Magenta
-    [255, 255, 0]   # Cyan
-]
+"""
+python detect_flats.py \
+    --source "path/to/source" \
+    --output "path/to/output" \
+    --surfaces 5 \
+    --encoder vitl \
+    --bandwidth 0.1
+"""
+def parse_args():
+    parser = argparse.ArgumentParser(description="Detect flat surfaces via clustering on normal vectors")
+    parser.add_argument('--source', type=Path, default=Path('assets/inputs'), help='Input directory with images')
+    parser.add_argument('--output', type=Path, default=Path('assets/outputs'), help='Output directory for results')
+    parser.add_argument('--surfaces', type=int, default=5, help='Number of flat surfaces to detect')
+    parser.add_argument('--encoder', type=str, choices=['vits', 'vitb', 'vitl', 'vitg'], default='vitl', help='DepthAnythingV2 encoder variant')
+    parser.add_argument('--bandwidth', type=float, default=0.1, help='MeanShift bandwidth')
+    return parser.parse_args()
 
 def main():
-    source_dir = r'C:\Users\Yankee\Documents\nexera\nexera-core\Depth-Anything-V2\assets\inputs'
-    output_dir = r'C:\Users\Yankee\Documents\nexera\nexera-core\Depth-Anything-V2\assets\outputs'
+    args = parse_args()
 
     DEVICE = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
-
-    interested_surface = 5
 
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -37,61 +44,77 @@ def main():
 
     flat_model = {
         "MeanShift": MeanShift(bandwidth=0.1, bin_seeding=True),
-        # "DBSCAN": DBSCAN(eps=0.3, min_samples=100, algorithm='ball_tree'),
-        # "KMeans": KMeans(n_clusters=interested_surface, random_state=42),
-        # "Agglomerative": AgglomerativeClustering(n_clusters=interested_surface),
-        # "GMM": GaussianMixture(n_components=interested_surface, covariance_type='full', random_state=42)
+        "KMeans": KMeans(n_clusters=args.surfaces, random_state=42),
+        "GMM": GaussianMixture(n_components=args.surfaces, covariance_type='full', random_state=42),
+        "BIRCH" : Birch(threshold=0.03, n_clusters=args.surfaces),
+        # "AffinityPropagation" : AffinityPropagation(damping=0.7) Not efficient enough,
+        # "DBSCAN": DBSCAN(eps=0.3, min_samples=100, algorithm='ball_tree') NOT EFFICIENT ENOUGH,
+        # "HDBSCAN": hdbscan.HDBSCAN(min_cluster_size=50) NOT Efficient enough,
+        # "Agglomerative": AgglomerativeClustering(n_clusters=interested_surface) NOT EFFICIENT ENOUGH,
     }
 
     encoder = 'vitl' # or 'vits', 'vitb', 'vitg'
 
-    model = DepthAnythingV2(**model_configs[encoder])
-    model.load_state_dict(torch.load(f'checkpoints/depth_anything_v2_{encoder}.pth', map_location='cpu'))
+    # Load depth model
+    model = DepthAnythingV2(**model_configs[args.encoder])
+    ckpt_path = f'checkpoints/depth_anything_v2_{args.encoder}.pth'
+    model.load_state_dict(torch.load(ckpt_path, map_location='cpu'))
     model = model.to(DEVICE).eval()
 
-    files = Path(source_dir).iterdir()
-    for file in tqdm(files, desc="Pipeline"):
+    # Prepare output folders
+    (args.output / 'normals').mkdir(parents=True, exist_ok=True)
+    (args.output / 'depths').mkdir(parents=True, exist_ok=True)
+    (args.output / 'flats').mkdir(parents=True, exist_ok=True)
+
+    # Process each image
+    for file in tqdm(list(args.source.glob("*")), desc="Processing Images"):
         raw_img = cv2.imread(file)
+        if raw_img is None:
+            continue  # Skip unreadable files
 
-        dmap = model.infer_image(raw_img) # HxW raw depth map in numpy
-
-        nmap = dmap_2_nmap(dmap)
+        dmap = model.infer_image(raw_img)   # H x W
+        nmap = dmap_2_nmap(dmap)            # H x W x 3
 
         name = file.name
-
-        os.makedirs(f'{output_dir}/normals/', exist_ok = True)
-        os.makedirs(f'{output_dir}/depths/', exist_ok = True)
-        os.makedirs(f'{output_dir}/flats', exist_ok = True)
-
-        cv2.imwrite(f'{output_dir}/normals/normal-{name}', nmap)
-        cv2.imwrite(f'{output_dir}/depths/depth-{name}', dmap)
-
-        # Reshape normal map for clustering
         H, W, _ = nmap.shape
-        normals = nmap.reshape(-1, 3) 
 
-        # Normalize normals
+        # Save normal and depth maps
+        cv2.imwrite(str(args.output / 'normals' / f'normal-{name}'), nmap)
+        cv2.imwrite(str(args.output / 'depths' / f'depth-{name}'), dmap)
+        
+        # Flatten and normalize normal vectors
+        normals = nmap.reshape(-1, 3) 
         norms = np.linalg.norm(normals, axis=1, keepdims=True)
         normals_normalized = normals / (norms + 1e-8)
 
-        for m_name, flat_clustering_model in flat_model.items():
-            labels = flat_clustering_model.fit_predict(normals_normalized)
+        # Dimensionality reduction using PCA
+        pca = PCA(n_components=3)
+        reduced_normals = pca.fit_transform(normals_normalized)
+
+        for model_name, flat_clustering_model in flat_model.items():
+            try:
+                labels = flat_clustering_model.fit_predict(reduced_normals)
+            except Exception as e:
+                print(f"Clustering failed for {model_name} on {name}: {e}")
+                continue
+
             labels_image = labels.reshape(H, W)
 
             # Find all the clusters
             unique_labels, counts = np.unique(labels, return_counts=True)
-            sort_counts = np.argsort(-counts)
 
+            # Generate colored overlay using cmap
             overlay = np.zeros((H, W, 3), dtype=np.uint8)
+            cmap = plt.get_cmap('tab20', len(unique_labels))
 
-            for i in sort_counts[:interested_surface]:
-                interested_label = unique_labels[i]
+            for i, label in enumerate(unique_labels):
+                if label == -1:
+                    continue # skip noise
+                color = np.array(cmap(i)[:3]) * 255
+                overlay[labels_image == label] = color.astype(np.uint8)
 
-                flat_mask = (labels_image == interested_label).astype(np.uint8)
-
-                overlay[flat_mask == 1] = predefined_colors[i]
-
-            cv2.imwrite(f'{output_dir}/flats/{m_name}-{name}', overlay)
+            out_path = args.output / 'flats' / f'{model_name}-{name}'
+            cv2.imwrite(str(out_path), overlay)
     
 if __name__ == "__main__":
     main()
